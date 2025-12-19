@@ -7,15 +7,15 @@ This repository contains data pipelines, models, and a Shiny application for exp
 ## Project Structure
 decarbonization_scenarios/
 * setup/ # Dependency management and environment setup
-  * etl/ # Data ingestion, cleaning, and transformation
-├── app/ # Shiny application
-│ ├── global.R # Global options, libraries, helper functions, preprocessing
-│ ├── server.R # Server logic
-│ └── ui.R # User interface
-├── data/ # Raw and processed datasets (gitignored as appropriate)
-├── models/ # Modeling code and scenario definitions
-├── output/ # Tables, figures, and exported results
-└── README.md
+* etl/ # Data ingestion, cleaning, and transformation
+* app/ # Shiny application
+  * global.R # Global options, libraries, helper functions, preprocessing
+  * server.R # Server logic
+  * ui.R # User interface
+* data/ # Raw and processed datasets (gitignored as appropriate)
+* models/ # Modeling code and scenario definitions
+* output/ # Tables, figures, and exported results
+* README.md
 
 
 ---

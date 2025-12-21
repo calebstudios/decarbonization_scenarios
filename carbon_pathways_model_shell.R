@@ -1,7 +1,40 @@
 library(tidyverse)
+library(readxl)
 
+# ---- Config ----
 years <- 2025:2030
+filename_in <- "Carbon_Pathways_Inputs_Sample.xlsx"
 
+# ---- Helpers ----
+fn_read_year <- function(filename_in, 
+                         sheet_in, 
+                         yr_start_col, 
+                         value_col_name = "value") {
+  data_in <- read_xlsx(path = filename_in, sheet = sheet_in)
+  
+  if (ncol(data_in) < yr_start_col) {
+    stop(glue(
+      "Sheet '{sheet_in}' has {ncol(data_in)} columns, but yr_start_col = {yr_start_col}."
+    ))
+  }
+  
+  colnames_in <- names(data_in)
+  colnames_yr <- colnames_in[yr_start_col:length(colnames_in)]
+  
+  data_out <- data_in %>% 
+    pivot_longer(
+      cols = all_of(colnames_yr), 
+      names_to = "Year", 
+      values_to = value_col_name
+      ) %>% 
+    mutate(
+      Year = suppressWarnings(as.integer(Year))
+    )
+  
+  data_out
+}
+
+# ---- Measures (shell metadata) ----
 measures <- tribble(
   ~measure_id, ~measure_name, ~sector, ~comp_group, ~tech_type, ~unit, 
   "ashp_rs", "Residential Air Source Heat Pump (space heating)", "Residential",	
@@ -20,28 +53,58 @@ measures <- tribble(
   "Flexibility", "Storage", "MW"
 )
 
-# Placeholder stock/activity drivers (replace with real data later)
-drivers <- expand_grid(year = years, segment = c("Residential", "Grid")) %>% 
+# --- Read Input Params ----
+input_params <- read_xlsx("Carbon_Pathways_Inputs_Sample.xlsx", 
+                          sheet = "Input_Params") %>% 
   mutate(
-    # interpretation placeholders - swap these later
-    eligible_units = case_when(
-      # households
-      segment == "Residential" ~ 1e6, 
-      # MW base
-      segment == "Grid" ~ 1e4 
-    )
+    SheetName = as.character(SheetName), 
+    YrStartCol = as.integer(YrStartCol), 
+    ValueName = as.character(ValueName)
   )
 
-# Placeholder targets: what % of eligible units adopt each year
+# ---- Load all input sheets into a named list ----
+inputs <- input_params %>% 
+  mutate(
+    data = pmap(
+      list(SheetName, YrStartCol, ValueName), 
+      ~fn_read_year(filename_in, ..1, ..2, value_col_name = ..3)
+    )
+  ) %>% 
+  select(SheetName, data) %>% 
+  deframe()
+
+# Optional: normalize names (no spaces)
+names(inputs) <- names(inputs) %>% 
+  str_replace_all("\\s+", "_")
+
+# ---- Drivers built from Stock sheet (replace hard-coded placeholders) ----
+# Expecting Stock sheet structure: Stock, Climate Zone, Year columns ...
+stock <- inputs[["Stock"]] %>% 
+  rename(year = Year)
+
+drivers <- stock %>% 
+  mutate(
+    sector = case_when(
+      str_detect(Stock, regex("household", ignore_case = TRUE)) ~ "Residential", 
+      # Fallback; refine when I add grid stock explicitly
+      TRUE ~ "Grid"
+    )
+  ) %>% 
+  group_by(year, sector) %>% 
+  summarise(
+    eligible_units = sum(stock_count_or_floor_area, na.rm = TRUE), 
+    .groups = "drop"
+  ) %>% 
+  filter(year %in% years)
+
+# ---- Placeholder targets ----
 targets <- expand_grid(year = years, measure_id = measures$measure_id) %>% 
-  # fill later
   mutate(target_adoption_share = NA_real_)
 
-# Shell output table (no math yet): one row per measure-year
+# ---- Shell output table ----
 model_shell <- expand_grid(year = years, measure_id = measures$measure_id) %>% 
   left_join(measures, by = "measure_id") %>% 
-  left_join(drivers %>% 
-              rename(sector = segment), by = c("year", "sector")) %>% 
+  left_join(drivers, by = c("year", "sector")) %>% 
   left_join(targets, by = c("year", "measure_id")) %>% 
   mutate(
     adopted_units = eligible_units * target_adoption_share, 
@@ -49,4 +112,4 @@ model_shell <- expand_grid(year = years, measure_id = measures$measure_id) %>%
     cost_nominal = NA_real_
   )
 
-model_shell %>% glimpse
+glimpse(model_shell)

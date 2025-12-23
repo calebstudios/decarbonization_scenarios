@@ -1,115 +1,118 @@
+#/******************************************************************************
+# PROGRAM NAME: carbon_pathways_model_shell.R
+# PROJECT: Decarbonization Scenarios
+# DESCRIPTION: Shell for loading inputs + assembling model-ready table
+# DATE: 2025-12-22
+# R-VERSION: R version 4.5.2 (2025-11-01)
+#******************************************************************************/
+
+#### Setup ####
 library(tidyverse)
 library(readxl)
 
-# ---- Config ----
+source("io_excel.R")
+
+#### Config ####
 years <- 2025:2030
-filename_in <- "Carbon_Pathways_Inputs_Sample.xlsx"
+input_workbook <- "Carbon_Pathways_Inputs_Sample.xlsx"
 
-# ---- Helpers ----
-fn_read_year <- function(filename_in, 
-                         sheet_in, 
-                         yr_start_col, 
-                         value_col_name = "value") {
-  data_in <- read_xlsx(path = filename_in, sheet = sheet_in)
-  
-  if (ncol(data_in) < yr_start_col) {
-    stop(glue(
-      "Sheet '{sheet_in}' has {ncol(data_in)} columns, but yr_start_col = {yr_start_col}."
-    ))
-  }
-  
-  colnames_in <- names(data_in)
-  colnames_yr <- colnames_in[yr_start_col:length(colnames_in)]
-  
-  data_out <- data_in %>% 
-    pivot_longer(
-      cols = all_of(colnames_yr), 
-      names_to = "Year", 
-      values_to = value_col_name
-      ) %>% 
-    mutate(
-      Year = suppressWarnings(as.integer(Year))
-    )
-  
-  data_out
-}
-
-# ---- Measures (shell metadata) ----
-measures <- tribble(
-  ~measure_id, ~measure_name, ~sector, ~comp_group, ~tech_type, ~unit, 
-  "ashp_rs", "Residential Air Source Heat Pump (space heating)", "Residential",	
-  "Space heating", "Demand", "household",
-  "hpwh_50", "Residential Heat Pump Water Heater (50 gal)", "Residential", 
-  "Water heating", "Demand", "household", 
-  "led_res", "Residential LED Lighting (general illumination)",	"Residential", 
-  "Lighting", "Demand", "household", 
-  "tstat_res", "Residential Smart Thermostat", "Residential", 
-  "HVAC controls", "Demand", "household",
-  "pv_util", "Utility-Scale Solar PV (one-axis tracking)", "Grid", 
-  "Electric generation", "Supply", "MW", 
-  "wind_lb", "Land-Based Wind", "Grid", 
-  "Electric generation", "Supply", "MW", 
-  "batt_4h", "Utility-Scale Li-ion Battery Storage (4-hour)", "Grid", 
-  "Flexibility", "Storage", "MW"
-)
-
-# --- Read Input Params ----
-input_params <- read_xlsx("Carbon_Pathways_Inputs_Sample.xlsx", 
-                          sheet = "Input_Params") %>% 
+#### Load Data ####
+input_params <- read_xlsx(input_workbook, sheet = "Input_Params") %>% 
   mutate(
     SheetName = as.character(SheetName), 
     YrStartCol = as.integer(YrStartCol), 
     ValueName = as.character(ValueName)
   )
 
-# ---- Load all input sheets into a named list ----
-inputs <- input_params %>% 
+# Split sheets: year-indexed vs non-year-indexed
+non_year_sheets <- c("Demand_Tech_Characteristics", "Stock_Turnover")
+
+year_sheet_params <- input_params %>% 
+  filter(!SheetName %in% non_year_sheets)
+
+# Load year-indexed sheets into long format
+demand_input_tables <- year_sheet_params %>% 
   mutate(
     data = pmap(
       list(SheetName, YrStartCol, ValueName), 
-      ~fn_read_year(filename_in, ..1, ..2, value_col_name = ..3)
+      ~fn_read_year(
+        filename_in = input_workbook, 
+        sheet_in = ..1, 
+        yr_start_col = ..2, 
+        value_col_name = ..3,
+      )
     )
   ) %>% 
   select(SheetName, data) %>% 
   deframe()
 
-# Optional: normalize names (no spaces)
-names(inputs) <- names(inputs) %>% 
+# Normalize list names
+names(demand_input_tables) <- names(demand_input_tables) %>% 
   str_replace_all("\\s+", "_")
 
-# ---- Drivers built from Stock sheet (replace hard-coded placeholders) ----
-# Expecting Stock sheet structure: Stock, Climate Zone, Year columns ...
-stock <- inputs[["Stock"]] %>% 
-  rename(year = Year)
+# Load non-year-indexed sheets "raw"
+demand_input_tables[["Demand_Tech_Characteristics"]] <- read_xlsx(
+  input_workbook, sheet = "Demand_Tech_Characteristics")
 
-drivers <- stock %>% 
-  mutate(
-    sector = case_when(
-      str_detect(Stock, regex("household", ignore_case = TRUE)) ~ "Residential", 
-      # Fallback; refine when I add grid stock explicitly
-      TRUE ~ "Grid"
-    )
-  ) %>% 
-  group_by(year, sector) %>% 
-  summarise(
-    eligible_units = sum(stock_count_or_floor_area, na.rm = TRUE), 
-    .groups = "drop"
-  ) %>% 
-  filter(year %in% years)
+demand_input_tables[["Stock_Turnover"]] <- read_xlsx(
+  input_workbook, sheet = "Stock_Turnover"
+)
 
-# ---- Placeholder targets ----
-targets <- expand_grid(year = years, measure_id = measures$measure_id) %>% 
-  mutate(target_adoption_share = NA_real_)
+#### Validate ####
+required_sheets <- c(
+  "Demand_Tech_Characteristics", 
+  "Baseline_Demand_Fuel_Mix", 
+  "Demand_Tech_Unit_Cost", 
+  "Demand_Tech_Efficiency", 
+  "Baseline_Efficiency", 
+  "Stock", 
+  "Demand_Scaling", 
+  "Stock_Turnover"
+)
 
-# ---- Shell output table ----
-model_shell <- expand_grid(year = years, measure_id = measures$measure_id) %>% 
-  left_join(measures, by = "measure_id") %>% 
-  left_join(drivers, by = c("year", "sector")) %>% 
-  left_join(targets, by = c("year", "measure_id")) %>% 
-  mutate(
-    adopted_units = eligible_units * target_adoption_share, 
-    energy_impact_mmbtu = NA_real_, 
-    cost_nominal = NA_real_
-  )
+missing_sheets <- setdiff(required_sheets, names(demand_input_tables))
+if (length(missing_sheets) > 0){
+  stop(glue::glue(paste0("Missing required input sheets: ", 
+                         "{paste(missing_sheets, collapse = ', ')}")))
+}
 
-glimpse(model_shell)
+# Quick sanity summary
+input_summary <- tibble(
+  sheet = names(demand_input_tables), 
+  n_rows = map_int(demand_input_tables, nrow), 
+  n_cols = map_int(demand_input_tables, ncol)
+) %>% 
+  arrange(sheet)
+
+print(input_summary)
+
+# Check year coverage where applicable
+year_check <- demand_input_tables %>% 
+  keep(~"Year" %in% names(.x) | "year" %in% names(.x)) %>% 
+  map(~{
+    ycol <- if("year" %in% names(.x)) "year" else "Year"
+    tibble(min_year = min(.x[[ycol]], na.rm = TRUE), 
+           max_year = max(.x[[ycol]], na.rm = TRUE))
+  }) %>% 
+  bind_rows(.id = "sheet")
+
+print(year_check)
+
+# Ensure required years exist in key year-indexed sheets
+key_year_sheets <- c("Baseline_Demand_Fuel_Mix", "Demand_Tech_Unit_Cost", 
+                     "Demand_Tech_Efficiency", "Baseline_Efficiency", "Stock", 
+                     "Demand_Scaling")
+missing_years <- map(key_year_sheets, ~setdiff(years, unique(demand_input_tables[[.x]]$year))) %>% 
+  set_names(key_year_sheets)
+
+missing_years <- keep(missing_years, ~length(.x) > 0)
+if (length(missing_years) > 0) {
+  stop(glue::glue(paste0("Missing years detected in: {paste(names(missing_years, collapse = ', ')}")))
+}
+
+#### TODO: model steps ####
+# 1) Build drivers from demand_input_tables$Stock
+# 2) Build measures from demand_input_tables$Demand_Tech_Characteristics 
+#    (+ supply tables later)
+# 3) Build adoption trajectories from saturation + uptake function
+# 4) Compute impacts (energy, cost, emissions)

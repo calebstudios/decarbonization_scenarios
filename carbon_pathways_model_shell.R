@@ -235,58 +235,137 @@ starting_tech_market_share <- demand_tech_char %>%
   mutate(StartingSaturation_perc = share * `Starting Saturation_percent`) %>% 
   select(-year)
 
-# TODO - make sure things are being indexed correctly and make sure the number 
-# of indexes are sufficient. This annual saturation right now is a function of 
-# stock turnover + new customers.
-# TODO - building a function that calculates a percent increase based on things 
-# like: stock turnover + new customers (base case), technology available, 
-# reasonable adoption.
-tech_annual_saturation_increase <- data.frame(DemandTechnology = c(
-  "Heat Pump Water Heater (50 gal)"), 
-  AnnualSatIncrease_perc = c(0.01)) %>% 
-  merge(data.frame(Year =seq(2025, 2030, 1))) %>% 
-  mutate(YearSatIncrease = AnnualSatIncrease_perc * (Year - 2025))
+# --- Decision variable(s) ---
+# For now: single variable = annual saturation increase for one tech
+# Starting guess
+x0 <- c(0.01)
+names(x0) <- "hpwh_annual_increase"
 
-# Change that starting tech year by year based on an assumed percentage increase
-# TODO limited by the max and min saturation increase & calculated through the 
-# uptake function that'll be the fuel mix and the demand tech forecast
-tech_demand_sat_forecast <- tech_annual_saturation_increase %>% 
-  left_join(starting_tech_market_share,
-            by = c("DemandTechnology" = "Demand Technology")) %>% 
-  mutate(YearSaturation = YearSatIncrease + StartingSaturation_perc) %>% 
-  select(DemandTechnology, Year, Sector, 
-         `Service Demand`, `Fuel Type`, YearSaturation)
+# Bounds: keep non-negative unless modeling backsliding
+lb <- c(0.00)
+ub <- c(0.05)
 
-# Calculate the new efficiency vector based on demand tech forecast
-new_mmbtu <- tech_demand_sat_forecast %>% 
-  mutate(Year = as.integer(Year)) %>% 
-  left_join(
-    mmbtu_output %>% 
-      select(climate_zone, year, service_demand, total_service_need), 
-    by = c("Year" = "year", "Service Demand" = "service_demand"), 
-    relationship = "many-to-many"
+discount_rate <- 0.05
+disc_tbl <- tibble(Year = years) %>% 
+  mutate(disc = 1 / (1 + discount_rate)^(Year - min(Year)))
+
+# Helper: safe clamp
+clamp01 <- function(x) pmin(pmax(x, 0), 1)
+
+# Objective wrapper for nloptr
+eval_f <- function(x) {
+  
+  # 1) Adoption trajectory for selected tech
+  tech_annual_saturation_increase <- tibble(
+    DemandTechnology = "Heat Pump Water Heater (50 gal)", 
+    AnnualSatIncrease_perc = x[1]
     ) %>% 
-  mutate(MMBTUNeed_Tech = YearSaturation * total_service_need) %>% 
-  left_join(
-    demand_tech_efficiency, 
-    by = c("DemandTechnology" = "Demand Technology", "Year" = "year"), 
-    relationship = "many-to-one"
-    ) %>% 
-  mutate(TotalMMBTU_input = MMBTUNeed_Tech / efficiency_metric_value)
+    tidyr::crossing(Year = years) %>%  
+    mutate(YearSatIncrease = AnnualSatIncrease_perc * (Year - min(Year)))
 
-new_mmbtu_input <- new_mmbtu %>% 
-  group_by(climate_zone, Year, `Service Demand`, `Fuel Type`) %>% 
-  summarise(Total_MMBTU_Consumption = sum(TotalMMBTU_input, na.rm = TRUE), 
-            .groups = "drop")
+  tech_demand_sat_forecast <- tech_annual_saturation_increase %>% 
+    left_join(
+      starting_tech_market_share,
+      by = c("DemandTechnology" = "Demand Technology")
+      ) %>% 
+    mutate(
+      YearSaturation = clamp01(YearSatIncrease + StartingSaturation_perc)
+      ) %>% 
+    select(DemandTechnology, Year, Sector, 
+           `Service Demand`, `Fuel Type`, YearSaturation)
 
-# TODO multiply by GHG emissions to get new GHG emissions
+  # 2) New fuel consumption (MMBtu) from adopted tech 
+  #   service need * saturation / efficiency
+  new_mmbtu <- tech_demand_sat_forecast %>% 
+    mutate(Year = as.integer(Year)) %>% 
+    left_join(
+      mmbtu_output %>% 
+        select(climate_zone, year, service_demand, total_service_need), 
+      by = c("Year" = "year", "Service Demand" = "service_demand"), 
+      relationship = "many-to-many"
+      ) %>% 
+    mutate(MMBTUNeed_Tech = YearSaturation * total_service_need) %>% 
+    left_join(
+      demand_tech_efficiency, 
+      by = c("DemandTechnology" = "Demand Technology", "Year" = "year"), 
+      relationship = "many-to-one"
+      ) %>% 
+    mutate(TotalMMBTU_input = MMBTUNeed_Tech / efficiency_metric_value)
 
-#### Next steps ####
-# Get reference and first step costs
-# New objective function is based on those costs
-# Then code in4 an optimization
-# 1) Build drivers from Stock + Demand_Scaling (including lighting kWh path)
-# 2) Build measures from Demand_Tech_Characteristics 
-#    (+ supply later)
-# 3) Build adoption trajectories from saturation + uptake function
-# 4) Compute impacts (energy, cost, emissions)
+  new_mmbtu_input <- new_mmbtu %>% 
+    group_by(climate_zone, Year, `Service Demand`, `Fuel Type`) %>% 
+    summarise(Total_MMBTU_Consumption = sum(TotalMMBTU_input, na.rm = TRUE), 
+              .groups = "drop")
+  
+  # 3) Emissions from new fuel consumption (simple placeholder factors)
+  new_emissions <- new_mmbtu_input %>% 
+    left_join(emissions_table, by = c("Fuel Type" = "fuel_type")) %>% 
+    mutate(Emissions = emissions_factor * Total_MMBTU_Consumption) %>% 
+    group_by(Year) %>% 
+    summarise(Emissions = sum(Emissions, na.rm = TRUE), .groups = "drop")
+  
+  # 4) Incremental units sold 
+  #  needs a clear stock basis; use Residential Households per climate_zone/year
+  hh_stock <- customer_stock %>% 
+    filter(Stock == "Residential Households") %>% 
+    rename(stock_count = stock_value) %>% 
+    select(climate_zone, year, stock_count)
+  
+  incr_units_sold <- tech_demand_sat_forecast %>% 
+    # Keep it scoped to the tech's service
+    filter(`Service Demand` == "Water Heating") %>% 
+    left_join(
+      hh_stock, 
+      by = c("Year" = "year"), 
+      relationship = "many-to-many"
+      ) %>% 
+    mutate(total_units = YearSaturation * stock_count) %>% 
+    arrange(DemandTechnology, climate_zone, Year) %>% 
+    group_by(DemandTechnology, climate_zone) %>% 
+    mutate(incr_units = total_units - lag(total_units)) %>% 
+    mutate(incr_units = if_else(is.na(incr_units), total_units, incr_units)) %>% 
+    ungroup()
+  
+  # 5) Cost = incremental units * unit cost
+  # NOTE: unit cost sheet key is "Demand Type" in the workbook
+  incr_cost <- incr_units_sold %>% 
+    left_join(
+      demand_tech_unit_cost, 
+      by = c("DemandTechnology" = "Demand Type", "Year" = "year"), 
+      relationship = "many-to-one"
+      ) %>% 
+    mutate(cost = incr_units * unit_cost_real_2024USD) %>% 
+    group_by(Year) %>% 
+    summarise(total_cost = sum(cost, na.rm = TRUE), .groups = "drop")
+  
+  # 6) NPV of cost
+  npv_cost <- incr_cost %>% 
+    left_join(disc_tbl, by = "Year") %>% 
+    mutate(npv_cost = total_cost * disc) %>% 
+    summarize(NPV = sum(npv_cost, na.rm = TRUE)) %>% 
+    pull(NPV)
+  
+  # Choose objective: 
+  # - cost-only minimization (current)
+  obj <- npv_cost
+  
+  return(obj)
+  }
+
+# Run optimization
+library(nloptr)
+
+opt_output <- nloptr::nloptr(
+  x0 = x0, 
+  eval_f = eval_f, 
+  lb = lb, 
+  ub = ub, 
+  opts = list(
+    algorithm = "NLOPT_GN_DIRECT", 
+    xtol_rel = 1.0e-8, 
+    maxeval = 200
+  )
+)
+
+opt_output$solution 
+opt_output$objective

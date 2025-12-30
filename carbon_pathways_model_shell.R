@@ -237,22 +237,12 @@ starting_tech_market_share <- demand_tech_char %>%
   mutate(StartingSaturation_perc = share * `Starting Saturation_percent`) %>% 
   select(-year)
 
-# --- Decision variable(s) ---
-# For now: single variable = annual saturation increase for one tech
-# Starting guess
-x0 <- c(0.25)
-names(x0) <- "hpwh_annual_increase"
-
-# Bounds: keep non-negative unless modeling backsliding
-lb <- c(0.05)
-ub <- c(0.80)
+# ---- Helpers ----
+clamp01 <- function(x) pmin(pmax(x, 0), 1)
 
 discount_rate <- 0.05
 disc_tbl <- tibble(Year = years) %>% 
   mutate(disc = 1 / (1 + discount_rate)^(Year - min(Year)))
-
-# ---- Helpers ----
-clamp01 <- function(x) pmin(pmax(x, 0), 1)
 
 # Map technologies to fuel types (make this a real input sheet later)
 tech_fuel_map <- tibble::tribble(
@@ -260,101 +250,61 @@ tech_fuel_map <- tibble::tribble(
   "Heat Pump Water Heater (50 gal)", "Electricity"
 )
 
-# Build annual eligible adopters = replacements + positive net new
-f.calc_eligible_customers <- function(customer_stock, stock_turnover, years) {
+# ---- Eligible customers ----
+f_calc_eligible_customers <- function(customer_stock, stock_turnover, years) {
   
-  stock_turnover <- stock_turnover %>% 
-    # TODO: fix in workbook
-    mutate(Stock = "Residential Households")
-  
+  # Expect stock_turnover already has Stock + Lifetime rows
   hh <- customer_stock %>% 
-    filter(Stock == "Residentital Households", year %in% years) %>% 
+    filter(Stock == "Residential Households", year %in% years) %>% 
     rename(stock_count = stock_value) %>% 
     arrange(climate_zone, year) %>% 
     group_by(climate_zone) %>% 
     mutate(
       prev_stock = lag(stock_count), 
-      net_new = stock_count - prev_stock, 
-      net_new = dplyr::if_else(is.na(net_new), 0, net_new), 
+      net_new = dplyr::if_else(is.na(prev_stock), 0, stock_count - prev_stock), 
       net_new_pos = pmax(net_new, 0)
     ) %>% 
     ungroup()
   
-  elig <- hh %>% 
-    left_join(stock_turnover %>% 
-                select(Stock, Lifetime), by = "Stock") %>% 
+  hh %>% 
+    left_join(
+      stock_turnover %>% 
+        select(Lifetime), 
+      by = character()
+    ) %>% 
     mutate(
       replacements = dplyr::if_else(is.na(prev_stock), 0, 
                                     prev_stock / Lifetime), 
       eligible_customers = replacements + net_new_pos
     ) %>% 
     select(climate_zone, year, stock_count, eligible_customers)
-  
-  elig
 }
 
-# Tech stock accounting: 
-# tech_stock_t = 
-#   min(stock, tech_stock_{t-1} + min(eligible * rate, stock-tech_stock_{t-1}))
-f.calc_annual_adoption <- function(x, 
-                                   years, 
-                                   customer_stock, 
-                                   stock_turnover, 
-                                   starting_tech_market_share) {
+# ---- Adoption accounting (tech stock roll-forward) ----
+f_calc_adoption <- function(x, years, elig, 
+                            starting_tech_market_share, 
+                            tech_name) {
   
-  # For now: single decision variable = 
-  #   steady-state adoption rate of eligible customers per year
-  # (Interpretation: among eligible customers each year, 
-  #   fraction that chooses the tech)
   adoption_rate <- clamp01(x[1])
   
-  elig <- f.calc_eligible_customers(customer_stock, stock_turnover, years)
+  # Starting saturation (assumed uniform across climate zones for now)
+  start_sat <- starting_tech_market_share %>% 
+    filter(`Demand Technology` == tech_name) %>% 
+    summarise(start_sat = first(StartingSaturation_perc), .groups = "drop") %>% 
+    pull(start_sat)
   
-  # Starting tech stock in first year (per climate_zone) 
-  # based on starting saturation % of stock
-  # NOTE: starting_tech_market_share must include 
-  # StartingSaturation_perc and Demand Technology + Service Demand
-  start <- starting_tech_market_share %>% 
-    filter(`Demand Technology` == "Heat Pump Water Heater (50 gal)") %>% 
-    select(Sector, `Service Demand`, `Demand Technology`, 
-           StartingSaturation_perc) %>% 
-    distinct()
-  
-  # Assume start saturation applies to all climate zones initially 
-  # (until provided CZ-specific saturation)
-  start_by_cz <- tidyr::crossing(
-    elig %>% 
-      filter(year == min(years)) %>% 
-      select(climate_zone, year, stock_count), 
-    start
-  ) %>% 
-    mutate(
-      tech_stock = stock_count * StartingSaturation_perc
-    ) %>% 
-    select(climate_zone, year, Sector, ServiceDemand = `Service Demand`, 
-           DemandTechnology = `Demand Technology`, 
-           stock_count, tech_stock)
-  
-  # Roll forward tech stock year by year
+  # Roll forward per climate zone
   out <- elig %>% 
     arrange(climate_zone, year) %>% 
     group_by(climate_zone) %>% 
     group_modify(~{
       cz <- .x
       
-      # Initialize
-      init_row <- start_by_cz %>% 
-        filter(climate_zone == cz$climate_zone[1])
-      tech_stock_prev <- init_row$tech_stock[1]
-      sector <- init_row$Sector[1]
-      service <- init_row$ServiceDemand[1]
-      tech <- init_row$DemandTechnology[1]
+      tech_stock_prev <- cz$stock_count[cz$year == min(years)][1] * start_sat
       
       res <- cz %>% 
         mutate(
-          Sector = sector, 
-          ServiceDemand = service, 
-          DemandTechnology = tech, 
+          DemandTechnology = tech_name, 
           tech_stock = NA_real_, 
           new_adopters = NA_real_
         )
@@ -365,7 +315,6 @@ f.calc_annual_adoption <- function(x,
         
         remaining <- pmax(stock_i - tech_stock_prev, 0)
         adopt_i <- pmin(elig_i * adoption_rate, remaining)
-        
         tech_stock_i <- pmin(stock_i, tech_stock_prev + adopt_i)
         
         res$tech_stock[i] <- tech_stock_i
@@ -377,97 +326,187 @@ f.calc_annual_adoption <- function(x,
       res
     }) %>% 
     ungroup() %>% 
-    mutate(
-      YearSaturation = clamp01(tech_stock / stock_count)
-    )
+    mutate(YearSaturation = clamp01(tech_stock / stock_count))
   
   out
 }
 
-# Objective wrapper
-eval_f <- function(x) {
+# ---- Water heating emissions delta vs baseline ---
+# Computes (baseline emissions displaced) and (new tech emissions added)
+f_calc_water_heat_emissions_delta <- function(adoption_tbl, 
+                                              service_need_tbl, 
+                                              demand_tech_efficiency, 
+                                              baseline_fuel_mix, 
+                                              baseline_efficiency, 
+                                              emissions_table) {
   
-  # Adoption path (returns tech_stock + YearSaturation + new_adopters)
-  adoption <- f.calc_annual_adoption(
-    x = x, 
-    years = years, 
+  # Focus on water heating service demand only
+  srv <- "Water Heating"
+  
+  # Baseline water heating fuel consumption by fuel type (from reference tables)
+  # service_need -> allocate by baseline fuel mix 
+  # -> divide by baseline efficiency
+  baseline_wh <- service_need_tbl %>% 
+    filter(service_demand == srv) %>% 
+    inner_join(
+      baseline_fuel_mix %>% 
+        filter(service_demand == srv), 
+      by = c("service_demand", "year")
+    ) %>% 
+    mutate(service_need_by_fuel = total_service_need * share) %>% 
+    inner_join(
+      baseline_efficiency %>% 
+        filter(service_demand == srv), 
+      by = c("service_demand", "fuel_type", "year")
+    ) %>% 
+    mutate(baseline_fuel_mmbtu = service_need_by_fuel / base_efficiency) %>% 
+    group_by(climate_zone, year, fuel_type) %>% 
+    summarise(baseline_fuel_mmbtu = sum(baseline_fuel_mmbtu, na.rm = TRUE), 
+              .groups = "drop") %>% 
+    left_join(emissions_table, by = "fuel_type") %>% 
+    group_by(climate_zone, year) %>% 
+    summarise(baseline_emissions = sum(emissions_factor * baseline_fuel_mmbtu, 
+                                       na.rm = TRUE), .groups = "drop")
+  
+  # New tech emissions for water heating: 
+  # tech service need share -> divide by tech efficiency -> multiply EF
+  adoption_wh <- adoption_tbl %>% 
+    filter(year %in% years) %>% 
+    mutate(service_demand = srv) %>% 
+    select(climate_zone, year, DemandTechnology, YearSaturation)
+  
+  tech_fuel <- adoption_wh %>% 
+    left_join(tech_fuel_map, by = "DemandTechnology") %>% 
+    left_join(
+      service_need_tbl %>% 
+        filter(service_demand == srv), 
+      by = c("climate_zone", "year")
+    ) %>% 
+    mutate(tech_service_need = YearSaturation * total_service_need) %>% 
+    left_join(
+      demand_tech_efficiency %>% 
+        # Keep flexible if sheet doesn't have this col
+        filter(`Demand Technology` == "Heat Pump Water Heater (50 gal)"), 
+        by = c("DemandTechnology" = "Demand Technology", "year" = "year")
+    ) %>% 
+    mutate(tech_fuel_mmbtu = tech_service_need / efficiency_metric_value) %>% 
+    left_join(emissions_table, by = "fuel_type") %>% 
+    group_by(climate_zone, year) %>% 
+    summarise(tech_emissions = sum(emissions_factor * tech_fuel_mmbtu, 
+                                   na.rm = TRUE), .groups = "drop")
+  
+  # Displaced baseline emissions are proportional to adoption saturation
+  delta <- baseline_wh %>% 
+    left_join(adoption_wh %>% 
+                select(climate_zone, year, YearSaturation), 
+              by = c("climate_zone", "year")) %>% 
+    mutate(displaced_emissions = baseline_emissions * YearSaturation) %>% 
+    select(climate_zone, year, baseline_emissions, displaced_emissions) %>% 
+    left_join(tech_fuel, by = c("climate_zone", "year")) %>% 
+    mutate(delta_emissions = tech_emissions - displaced_emissions) %>% 
+    group_by(year) %>% 
+    summarise(
+      delta_emissions = sum(delta_emissions, na.rm = TRUE), 
+      tech_emissions = sum(tech_emissions, na.rm = TRUE), 
+      displaced_emissions = sum(displaced_emissions, na.rm = TRUE), 
+      .groups = "drop"
+    )
+  
+  delta
+}
+
+# ---- Objective: minimize NPV of incremental tech costs ----
+npv_objective_f <- function(x) {
+  
+  elig <- f_calc_eligible_customers(
     customer_stock = customer_stock, 
     stock_turnover = demand_input_tables$Stock_Turnover, 
-    starting_tech_market_share = starting_tech_market_share
+    years = years
   )
   
-  # Join service need (MMBtu at service level)
-  service_need <- mmbtu_output %>% 
-    select(climate_zone, year, service_demand, total_service_need)
+  adoption <- f_calc_adoption(
+    x = x, 
+    years = years, 
+    elig = elig,
+    starting_tech_market_share = starting_tech_market_share, 
+    tech_name = "Heat Pump Water Heater (50 gal)"
+  )
   
-  # Fuel mapping for the tech (explicit fuel switching)
-  adoption2 <- adoption %>% 
-    left_join(tech_fuel_map, by = "DemandTechnology")
-
-  # Tech service demand should match workbook naming
-  # Here: assume HPWH affects "Water Heating"
-  new_mmbtu <- adoption2 %>% 
-    filter(ServiceDemand == "Water Heating") %>%  
-    left_join(
-      service_need %>% 
-        filter(service_demand == "Water Heating"), 
-      by = c("climate_zone", "year"), 
-      relationship = "many-to-one"
-      ) %>% 
-    mutate(MMBTUNeed_Tech = YearSaturation * total_service_need) %>% 
-    left_join(
-      demand_tech_efficiency, 
-      by = c("DemandTechnology" = "Demand Technology", "year" = "year"), 
-      relationship = "many-to-one"
-      ) %>% 
-    mutate(
-      total_fuel_consumption_mmbtu = MMBTUNeed_Tech / efficiency_metric_value
-      ) %>% 
-    select(climate_zone, year, ServiceDemand, 
-           fuel_type, total_fuel_consumption_mmbtu)
-  
-  # Emissions (still placeholder factors)
-  new_emissions <- new_mmbtu %>% 
-    left_join(emissions_table, by = "fuel_type") %>% 
-    mutate(emissions = emissions_factor * total_fuel_consumption_mmbtu) %>% 
-    group_by(year) %>% 
-    summarise(emissions = sum(emissions, na.rm = TRUE), .groups = "drop")
-  
-  # Cost: incremental adopters * unit cost 
-  # (clamp negative to 0; already non-negative by construction)
-  incr_cost <- adoption2 %>% 
+  incr_cost <- adoption %>% 
     left_join(
       demand_tech_unit_cost, 
-      by = c("DemandTechnology" = "Demand Type", "year" = "year"), 
-      relationship = "many-to-one"
+      by = c("DemandTechnology" = "Demand Type", "year" = "year")
       ) %>% 
     mutate(cost = new_adopters * unit_cost_real_2024USD) %>% 
     group_by(year) %>% 
     summarise(total_cost = sum(cost, na.rm = TRUE), .groups = "drop")
   
-  # NPV
   npv_cost <- incr_cost %>% 
     left_join(disc_tbl, by = c("year" = "Year")) %>% 
     mutate(npv_cost = total_cost * disc) %>% 
     summarize(NPV = sum(npv_cost, na.rm = TRUE)) %>% 
     pull(NPV)
   
-  # Current objective: minimize cost only
   npv_cost
-  }
+}
 
-# Run optimization
+# ---- Equality constraint: hit a 2030 emissions target ----
+# Water heating-adjusted total
+target_year <- 2030
+# Interpret as total emissions in target_year
+target_emissions_total <- 1480000
+
+f_emissions_constraint <- function(x) {
+  
+  elig <- f_calc_eligible_customers(customer_stock, 
+                                    demand_input_tables$Stock_Turnover, years)
+  adoption <- f_calc_adoption(x, years, elig, 
+                              starting_tech_market_share, 
+                              "Heat Pump Water Heater (50 gal)")
+  
+  service_need_tbl <- mmbtu_output %>% 
+    select(climate_zone, year, service_demand, total_service_need)
+  
+  delta_wh <- f_calc_water_heat_emissions_delta(
+    adoption_tbl = adoption, 
+    service_need_tbl = service_need_tbl, 
+    demand_tech_efficiency = demand_tech_efficiency, 
+    baseline_fuel_mix = baseline_fuel_mix, 
+    baseline_efficiency = baseline_efficiency, 
+    emissions_table = emissions_table
+  )
+  
+  # Total emissions = reference total + delta (water heating only)
+  total_adj <- ref_emissions %>% 
+    left_join(delta_wh %>% 
+                select(year, delta_emissions), by = "year") %>% 
+    mutate(delta_emissions = replace_na(delta_emissions, 0), 
+           emissions_adj = emissions + delta_emissions)
+  
+  e_target <- total_adj %>% 
+    filter(year == target_year) %>% 
+    pull(emissions_adj)
+  
+  e_target - target_emissions_total
+}
+
+# ---- Optimize ----
 library(nloptr)
+
+x0 <- c(hpwh_adoption_rate = 0.04)
+lb <- c(0.00)
+ub <- c(1.00)
 
 opt_output <- nloptr::nloptr(
   x0 = x0, 
-  eval_f = eval_f, 
+  eval_f = npv_objective_f, 
+  eval_g_eq = f_emissions_constraint,
   lb = lb, 
   ub = ub, 
   opts = list(
-    algorithm = "NLOPT_GN_DIRECT", 
+    algorithm = "NLOPT_LN_COBYLA", 
     xtol_rel = 1.0e-8, 
-    maxeval = 200
+    maxeval = 500
   )
 )
 
